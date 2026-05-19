@@ -1,0 +1,27 @@
+[package]
+name = "scrutiny-server-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Scrutiny-protocol-compatible server with pluggable datasources"
+
+[[bin]]
+name = "scrutiny-server-rs"
+path = "src/main.rs"
+
+[[example]]
+name = "sine_source"
+path = "examples/sine_source.rs"
+
+[dependencies]
+tokio       = { version = "1", features = ["full"] }
+tokio-util  = { version = "0.7", features = ["codec"] }
+futures     = "0.3"
+bytes       = "1"
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+flate2      = "1"
+md-5        = "0.10"
+uuid        = { version = "1", features = ["v4"] }
+log         = "0.4"
+env_logger  = "0.11"
+anyhow      = "1"
