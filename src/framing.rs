@@ -181,7 +181,12 @@ fn parse_header(s: &str, header_end: usize) -> Option<PendingFrame> {
     let compressed = flags.contains('c');
     let use_hash = flags.contains('h');
 
-    Some(PendingFrame { header_end, data_size, compressed, use_hash })
+    Some(PendingFrame {
+        header_end,
+        data_size,
+        compressed,
+        use_hash,
+    })
 }
 
 #[cfg(test)]
@@ -207,7 +212,9 @@ mod tests {
     fn incremental_delivery() {
         let mut codec = ScrutinyCodec::new();
         let mut encoded = BytesMut::new();
-        codec.encode(serde_json::json!({"x": 42}), &mut encoded).unwrap();
+        codec
+            .encode(serde_json::json!({"x": 42}), &mut encoded)
+            .unwrap();
 
         // Feed one byte at a time
         let mut partial = BytesMut::new();

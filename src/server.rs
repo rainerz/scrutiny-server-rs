@@ -40,8 +40,8 @@ use uuid::Uuid;
 
 use crate::{
     api_types::{cmd, *},
+    datasource::{ConnectionStatus, DataSource, WatchableKind, WatchableValue, WriteCommand},
     datastore::{Datastore, ValueStore},
-    datasource::{DataSource, WatchableKind, WatchableValue, WriteCommand},
     framing::ScrutinyCodec,
 };
 
@@ -51,6 +51,9 @@ use crate::{
 #[derive(Clone, Debug)]
 pub struct ValueEvent {
     pub updates: Arc<Vec<(String, WatchableValue)>>,
+    /// Timestamp from the datasource (microseconds since server start).
+    /// Used as the `t` field in every `watchable_update` message.
+    pub timestamp_us: f64,
 }
 
 // ── shared server state ──────────────────────────────────────────────────────
@@ -63,14 +66,25 @@ struct ServerShared {
     session_id: String,
     /// Approximate count of active connections (best-effort).
     conn_count: Arc<Mutex<usize>>,
+    /// Latest connection status reported by the datasource.
+    /// Updated by the poller task; read by `make_server_status`.
+    conn_status: Arc<Mutex<ConnectionStatus>>,
 }
 
 // ── public entry point ───────────────────────────────────────────────────────
 
 /// Start the Scrutiny-compatible server.
 ///
+/// `poll_interval_ms` controls how often the datasource's `poll()` method is
+/// called and how frequently value updates are pushed to connected clients.
+/// Typical values: 100 ms (10 Hz), 20 ms (50 Hz), 10 ms (100 Hz).
+///
 /// Blocks until the process is interrupted.
-pub async fn run<DS: DataSource>(datasource: DS, addr: &str) -> anyhow::Result<()> {
+pub async fn run<DS: DataSource>(
+    datasource: DS,
+    addr: &str,
+    poll_interval_ms: u64,
+) -> anyhow::Result<()> {
     // --- build datastore from datasource metadata ---------------------------
     let mut datastore = Datastore::default();
     datastore.populate(datasource.watchables());
@@ -84,6 +98,7 @@ pub async fn run<DS: DataSource>(datasource: DS, addr: &str) -> anyhow::Result<(
 
     let session_id = Uuid::new_v4().to_string();
     let conn_count = Arc::new(Mutex::new(0usize));
+    let conn_status = Arc::new(Mutex::new(ConnectionStatus::Connected));
 
     let shared = Arc::new(ServerShared {
         datastore: datastore.clone(),
@@ -92,10 +107,19 @@ pub async fn run<DS: DataSource>(datasource: DS, addr: &str) -> anyhow::Result<(
         start_time: Instant::now(),
         session_id,
         conn_count: conn_count.clone(),
+        conn_status: conn_status.clone(),
     });
 
     // --- start background tasks ---------------------------------------------
-    spawn_poller(datasource, value_store.clone(), value_tx.clone(), write_rx);
+    spawn_poller(
+        datasource,
+        value_store.clone(),
+        value_tx.clone(),
+        write_rx,
+        poll_interval_ms,
+        shared.start_time,
+        conn_status,
+    );
 
     // --- listen for connections ---------------------------------------------
     let listener = TcpListener::bind(addr).await?;
@@ -112,7 +136,9 @@ pub async fn run<DS: DataSource>(datasource: DS, addr: &str) -> anyhow::Result<(
         *conn_count.lock().unwrap() += 1;
 
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, conn_id.clone(), shared.clone(), value_rx).await {
+            if let Err(e) =
+                handle_connection(stream, conn_id.clone(), shared.clone(), value_rx).await
+            {
                 log::warn!("[{}] connection error: {}", conn_id, e);
             }
             *shared.conn_count.lock().unwrap() -= 1;
@@ -128,30 +154,38 @@ fn spawn_poller<DS: DataSource>(
     value_store: Arc<Mutex<ValueStore>>,
     tx: broadcast::Sender<ValueEvent>,
     mut write_rx: mpsc::Receiver<WriteCommand>,
+    poll_interval_ms: u64,
+    start: Instant,
+    conn_status: Arc<Mutex<ConnectionStatus>>,
 ) {
     tokio::spawn(async move {
-        let mut poll_interval = time::interval(Duration::from_millis(100));
+        let mut poll_interval = time::interval(Duration::from_millis(poll_interval_ms));
         loop {
             tokio::select! {
                 _ = poll_interval.tick() => {
-                    let updates = ds.poll();
-                    if !updates.is_empty() {
+                    let now_us = start.elapsed().as_secs_f64() * 1_000_000.0;
+                    // Update connection status before polling values.
+                    *conn_status.lock().unwrap() = ds.connection_status();
+                    let result = ds.poll(now_us);
+                    if !result.updates.is_empty() {
+                        let ts = result.timestamp_us;
                         let mut store = value_store.lock().unwrap();
-                        let pairs: Vec<(String, WatchableValue)> = updates
+                        let pairs: Vec<(String, WatchableValue)> = result.updates
                             .into_iter()
                             .map(|u| {
-                                store.set(&u.id, u.value.clone());
-                                (u.id, u.value)
+                                store.set(&u.path, u.value.clone());
+                                (u.path, u.value)
                             })
                             .collect();
                         drop(store);
-                        let _ = tx.send(ValueEvent { updates: Arc::new(pairs) });
+                        log::trace!("poll: {} updates, ts={:.0} µs", pairs.len(), ts);
+                        let _ = tx.send(ValueEvent { updates: Arc::new(pairs), timestamp_us: ts });
                     }
                 }
                 Some(cmd) = write_rx.recv() => {
-                    match ds.write(&cmd.id, cmd.value) {
-                        Ok(_) => log::debug!("write ok: {}", cmd.id),
-                        Err(e) => log::warn!("write failed: {}: {}", cmd.id, e),
+                    match ds.write(&cmd.path, cmd.value) {
+                        Ok(_) => log::debug!("write ok: {}", cmd.path),
+                        Err(e) => log::warn!("write failed: {}: {}", cmd.path, e),
                     }
                 }
             }
@@ -175,7 +209,10 @@ async fn handle_connection(
     mut value_rx: broadcast::Receiver<ValueEvent>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut framed = Framed::new(stream, ScrutinyCodec::new());
-    let mut state = ConnState { subscriptions: HashMap::new(), invalid_request_count: 0 };
+    let mut state = ConnState {
+        subscriptions: HashMap::new(),
+        invalid_request_count: 0,
+    };
 
     // send welcome on connect
     send(&mut framed, make_welcome(shared.start_time)).await?;
@@ -227,10 +264,11 @@ async fn handle_connection(
                             .map(|(id, val)| WatchableUpdateRecord {
                                 id: id.clone(),
                                 v: val.to_json(),
-                                t: server_time_us(shared.start_time),
+                                t: ev.timestamp_us,
                             })
                             .collect();
                         if !updates.is_empty() {
+                            log::trace!("[{conn_id}] pushing {} value updates", updates.len());
                             let msg = json_serialize(&S2cWatchableUpdate {
                                 cmd: cmd::WATCHABLE_UPDATE,
                                 reqid: None,
@@ -244,6 +282,7 @@ async fn handle_connection(
 
             // ── periodic server status push ───────────────────────────────
             _ = status_interval.tick() => {
+                log::debug!("[{conn_id}] periodic server status push");
                 send(&mut framed, make_server_status(&shared, None)).await?;
             }
         }
@@ -261,6 +300,7 @@ async fn dispatch(
     state: &mut ConnState,
     shared: &Arc<ServerShared>,
 ) -> Result<Vec<Value>, String> {
+    log::debug!("dispatch: cmd={} reqid={:?}", cmd_name, reqid);
     match cmd_name {
         cmd::ECHO => {
             let payload = msg["payload"].as_str().ok_or("missing payload")?;
@@ -370,9 +410,9 @@ async fn dispatch(
                 .collect::<Vec<_>>();
             let mut info = std::collections::HashMap::new();
             for path in paths {
-                let entry = shared.datastore.get_by_path(path)
+                let entry = shared.datastore.get(path)
                     .ok_or_else(|| format!("Unknown watchable: {path}"))?;
-                info.insert(path.to_owned(), make_detailed(&entry.definition));
+                info.insert(path.to_owned(), make_detailed(entry));
             }
             Ok(vec![json_serialize(&S2cGetWatchableInfo { cmd: cmd::RESPONSE_GET_WATCHABLE_INFO, reqid, info })])
         }
@@ -385,11 +425,12 @@ async fn dispatch(
                 .collect::<Vec<_>>();
             let mut subscribed = std::collections::HashMap::new();
             for path in &paths {
-                let entry = shared.datastore.get_by_path(path)
+                let entry = shared.datastore.get(path)
                     .ok_or_else(|| format!("Unknown watchable: {path}"))?;
-                subscribed.insert(path.to_string(), make_detailed(&entry.definition));
-                state.subscriptions.insert(entry.definition.id.clone(), ());
+                subscribed.insert(path.to_string(), make_detailed(entry));
+                state.subscriptions.insert(path.to_string(), ());
             }
+            log::debug!("subscribed to {} watchables", paths.len());
             let mut out = vec![json_serialize(&S2cSubscribeWatchable {
                 cmd: cmd::RESPONSE_SUBSCRIBE_WATCHABLE,
                 reqid,
@@ -398,10 +439,10 @@ async fn dispatch(
             // Send current values immediately after subscription
             let store = shared.value_store.lock().unwrap();
             let updates: Vec<WatchableUpdateRecord> = paths.iter()
-                .filter_map(|p| shared.datastore.get_by_path(p))
+                .filter_map(|p| shared.datastore.get(p))
                 .filter_map(|e| {
-                    store.get(&e.definition.id).map(|val| WatchableUpdateRecord {
-                        id: e.definition.id.clone(),
+                    store.get(&e.definition.path).map(|val| WatchableUpdateRecord {
+                        id: e.definition.path.clone(),
                         v: val.to_json(),
                         t: server_time_us(shared.start_time),
                     })
@@ -422,11 +463,12 @@ async fn dispatch(
                 .collect::<Vec<_>>();
             let mut unsubscribed = Vec::new();
             for path in &paths {
-                if let Some(entry) = shared.datastore.get_by_path(path) {
-                    state.subscriptions.remove(&entry.definition.id);
+                if let Some(_) = shared.datastore.get(path) {
+                    state.subscriptions.remove(*path);
                 }
                 unsubscribed.push(path.to_string());
             }
+            log::debug!("unsubscribed from {} watchables", paths.len());
             Ok(vec![json_serialize(&S2cUnsubscribeWatchable {
                 cmd: cmd::RESPONSE_UNSUBSCRIBE_WATCHABLE,
                 reqid,
@@ -485,11 +527,11 @@ async fn dispatch(
             let count = updates_arr.len();
             let mut write_cmds = Vec::new();
             for upd in updates_arr {
-                let id = upd["watchable"].as_str().ok_or("missing watchable id")?.to_owned();
-                shared.datastore.get_by_id(&id).ok_or_else(|| format!("Unknown watchable id: {id}"))?;
+                let path = upd["watchable"].as_str().ok_or("missing watchable id")?.to_owned();
+                shared.datastore.get(&path).ok_or_else(|| format!("Unknown watchable: {path}"))?;
                 let batch_index = upd["batch_index"].as_i64().ok_or("missing batch_index")?;
                 let value = parse_write_value(&upd["value"])?;
-                write_cmds.push((id, batch_index, value));
+                write_cmds.push((path, batch_index, value));
             }
             let mut out = vec![json_serialize(&S2cWriteWatchable {
                 cmd: cmd::RESPONSE_WRITE_WATCHABLE,
@@ -498,10 +540,10 @@ async fn dispatch(
                 count,
             })];
             let now_us = server_time_us(shared.start_time);
-            for (id, batch_index, value) in write_cmds {
-                let watchable_id = id.clone();
+            for (path, batch_index, value) in write_cmds {
+                let watchable_path = path.clone();
                 let _ = shared.write_tx.try_send(WriteCommand {
-                    id,
+                    path,
                     value,
                     request_token: request_token.clone(),
                     batch_index,
@@ -510,7 +552,7 @@ async fn dispatch(
                     cmd: cmd::INFORM_WRITE_COMPLETION,
                     reqid: None,
                     batch_index,
-                    watchable: watchable_id,
+                    watchable: watchable_path,
                     success: true,
                     request_token: request_token.clone(),
                     completion_server_time_us: now_us,
@@ -521,11 +563,11 @@ async fn dispatch(
 
         cmd::WRITE_SINGLE_WATCHABLE => {
             let path = msg["server_path"].as_str().ok_or("missing server_path")?;
-            let entry = shared.datastore.get_by_path(path)
+            let entry = shared.datastore.get(path)
                 .ok_or_else(|| format!("Unknown watchable path: {path}"))?;
             let value = parse_write_value(&msg["value"])?;
             let _ = shared.write_tx.try_send(WriteCommand {
-                id: entry.definition.id.clone(),
+                path: entry.definition.path.clone(),
                 value,
                 request_token: Uuid::new_v4().to_string(),
                 batch_index: 0,
@@ -573,7 +615,7 @@ async fn send(
 }
 
 fn server_time_us(start: Instant) -> f64 {
-    start.elapsed().as_micros() as f64
+    start.elapsed().as_secs_f64() * 1_000_000.0
 }
 
 fn make_welcome(start: Instant) -> Value {
@@ -591,11 +633,17 @@ fn make_welcome(start: Instant) -> Value {
 }
 
 fn make_server_status(shared: &ServerShared, reqid: Option<i64>) -> Value {
+    let status = shared.conn_status.lock().unwrap().clone();
+    let (device_status, device_session_id, link_operational) = match status {
+        ConnectionStatus::Connected => ("connected_ready", Some(shared.session_id.clone()), true),
+        ConnectionStatus::Connecting => ("connecting", None, false),
+        ConnectionStatus::Disconnected => ("disconnected", None, false),
+    };
     json_serialize(&S2cInformServerStatus {
         cmd: cmd::INFORM_SERVER_STATUS,
         reqid,
-        device_status: "connected_ready",
-        device_session_id: Some(shared.session_id.clone()),
+        device_status,
+        device_session_id,
         loaded_sfd_firmware_id: None,
         datalogging_status: DataloggingStatus {
             datalogging_state: "unavailable",
@@ -603,7 +651,7 @@ fn make_server_status(shared: &ServerShared, reqid: Option<i64>) -> Value {
         },
         device_comm_link: DeviceCommLink {
             link_type: "none",
-            link_operational: false,
+            link_operational,
             link_config: json!({}),
             demo_mode: false,
         },
@@ -649,9 +697,10 @@ fn make_error(reqid: Option<i64>, request_cmd: &str, msg: &str) -> Value {
     })
 }
 
-fn make_detailed(def: &crate::datasource::WatchableDefinition) -> Value {
+fn make_detailed(entry: &crate::datastore::DatastoreEntry) -> Value {
+    let def = &entry.definition;
     let mut obj = json!({
-        "id":    def.id,
+        "id":    def.path,
         "path":  def.path,
         "dtype": def.dtype.as_api_str(),
         "type":  def.kind.as_api_str(),
@@ -659,12 +708,12 @@ fn make_detailed(def: &crate::datasource::WatchableDefinition) -> Value {
     });
     match def.kind {
         WatchableKind::Var => {
-            obj["address"]   = Value::Null;
+            obj["address"] = Value::Null;
             obj["bitoffset"] = Value::Null;
-            obj["bitsize"]   = Value::Null;
+            obj["bitsize"] = Value::Null;
         }
         WatchableKind::Rpv => {
-            obj["rpvid"] = Value::from(def.rpv_id);
+            obj["rpvid"] = Value::from(u32::from(entry.rpv_id));
         }
         WatchableKind::Alias => {
             // Alias support is not implemented; caller should not pass Alias entries.
@@ -679,16 +728,26 @@ fn extract_type_filter(msg: &Value) -> Option<Vec<WatchableKind>> {
     let types = if type_val.is_string() {
         vec![type_val.as_str().unwrap().to_owned()]
     } else if type_val.is_array() {
-        type_val.as_array().unwrap().iter().filter_map(|v| v.as_str().map(str::to_owned)).collect()
+        type_val
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect()
     } else {
         return None;
     };
-    Some(types.into_iter().filter_map(|t| match t.as_str() {
-        "var" => Some(WatchableKind::Var),
-        "rpv" => Some(WatchableKind::Rpv),
-        "alias" => Some(WatchableKind::Alias),
-        _ => None,
-    }).collect())
+    Some(
+        types
+            .into_iter()
+            .filter_map(|t| match t.as_str() {
+                "var" => Some(WatchableKind::Var),
+                "rpv" => Some(WatchableKind::Rpv),
+                "alias" => Some(WatchableKind::Alias),
+                _ => None,
+            })
+            .collect(),
+    )
 }
 
 fn parse_write_value(v: &Value) -> Result<WatchableValue, String> {
@@ -705,9 +764,15 @@ fn parse_write_value(v: &Value) -> Result<WatchableValue, String> {
         }
         Value::String(s) => {
             let s = s.to_lowercase();
-            if s == "true" { return Ok(WatchableValue::Bool(true)); }
-            if s == "false" { return Ok(WatchableValue::Bool(false)); }
-            s.parse::<f64>().map(WatchableValue::Float).map_err(|_| format!("Cannot parse value: {s}"))
+            if s == "true" {
+                return Ok(WatchableValue::Bool(true));
+            }
+            if s == "false" {
+                return Ok(WatchableValue::Bool(false));
+            }
+            s.parse::<f64>()
+                .map(WatchableValue::Float)
+                .map_err(|_| format!("Cannot parse value: {s}"))
         }
         _ => Err(format!("Unsupported value type: {v}")),
     }

@@ -1,42 +1,49 @@
-use std::collections::HashMap;
 use crate::datasource::{WatchableDefinition, WatchableValue};
+use std::collections::HashMap;
 
 /// An entry in the in-memory watchable registry.
 #[derive(Debug, Clone)]
 pub struct DatastoreEntry {
     pub definition: WatchableDefinition,
+    /// 16-bit wire ID assigned automatically at startup for RPV entries.
+    /// Sequential, starting at 0. Meaningless for Var/Alias entries.
+    pub rpv_id: u16,
 }
 
 /// Shared, read-only metadata store. Built once at startup from the datasource.
+/// Keyed by `path` — the unique identifier for every watchable.
 /// Current values are stored separately in `ValueStore`.
 #[derive(Debug, Default)]
 pub struct Datastore {
-    /// Keyed by watchable ID.
     entries: HashMap<String, DatastoreEntry>,
-    /// Reverse lookup: display path → ID.
-    by_path: HashMap<String, String>,
 }
 
 impl Datastore {
     pub fn populate(&mut self, defs: Vec<WatchableDefinition>) {
+        let mut next_rpv_id: u16 = 0;
         for def in defs {
-            let id = def.id.clone();
             let path = def.path.clone();
-            self.entries.insert(id.clone(), DatastoreEntry { definition: def });
-            self.by_path.insert(path, id);
+            let rpv_id = if def.kind == crate::datasource::WatchableKind::Rpv {
+                let assigned = next_rpv_id;
+                next_rpv_id = next_rpv_id
+                    .checked_add(1)
+                    .expect("RPV count exceeds u16 limit (65535)");
+                assigned
+            } else {
+                0
+            };
+            self.entries.insert(
+                path,
+                DatastoreEntry {
+                    definition: def,
+                    rpv_id,
+                },
+            );
         }
     }
 
-    pub fn get_by_id(&self, id: &str) -> Option<&DatastoreEntry> {
-        self.entries.get(id)
-    }
-
-    pub fn get_by_path(&self, path: &str) -> Option<&DatastoreEntry> {
-        self.by_path.get(path).and_then(|id| self.entries.get(id))
-    }
-
-    pub fn id_for_path(&self, path: &str) -> Option<&str> {
-        self.by_path.get(path).map(String::as_str)
+    pub fn get(&self, path: &str) -> Option<&DatastoreEntry> {
+        self.entries.get(path)
     }
 
     pub fn all_entries(&self) -> impl Iterator<Item = &DatastoreEntry> {
@@ -44,15 +51,24 @@ impl Datastore {
     }
 
     pub fn var_count(&self) -> usize {
-        self.entries.values().filter(|e| e.definition.kind == crate::datasource::WatchableKind::Var).count()
+        self.entries
+            .values()
+            .filter(|e| e.definition.kind == crate::datasource::WatchableKind::Var)
+            .count()
     }
 
     pub fn alias_count(&self) -> usize {
-        self.entries.values().filter(|e| e.definition.kind == crate::datasource::WatchableKind::Alias).count()
+        self.entries
+            .values()
+            .filter(|e| e.definition.kind == crate::datasource::WatchableKind::Alias)
+            .count()
     }
 
     pub fn rpv_count(&self) -> usize {
-        self.entries.values().filter(|e| e.definition.kind == crate::datasource::WatchableKind::Rpv).count()
+        self.entries
+            .values()
+            .filter(|e| e.definition.kind == crate::datasource::WatchableKind::Rpv)
+            .count()
     }
 }
 
