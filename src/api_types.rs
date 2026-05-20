@@ -350,6 +350,7 @@ pub mod cmd {
     pub const WRITE_WATCHABLE: &str = "write_watchable";
     pub const WRITE_SINGLE_WATCHABLE: &str = "write_single_watchable";
     pub const GET_SERVER_STATS: &str = "get_server_stats";
+    pub const SET_THROTTLING: &str = "set_throttling";
 
     // server → client
     pub const WELCOME: &str = "welcome";
@@ -372,6 +373,7 @@ pub mod cmd {
     pub const RESPONSE_GET_LOADED_SFD: &str = "response_get_loaded_sfd";
     pub const RESPONSE_SET_LINK_CONFIG: &str = "response_set_link_config";
     pub const RESPONSE_GET_SERVER_STATS: &str = "response_get_server_stats";
+    pub const RESPONSE_SET_THROTTLING: &str = "response_set_throttling";
 
     // datalogging – we return empty/unavailable responses for these
     pub const REQUEST_DATALOGGING_ACQUISITION: &str = "request_datalogging_acquisition";

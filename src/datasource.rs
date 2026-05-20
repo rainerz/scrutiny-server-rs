@@ -1,4 +1,6 @@
 /// A watchable data type, matching the Scrutiny API type strings.
+use std::collections::HashSet;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DataType {
     Sint8,
@@ -170,7 +172,10 @@ pub trait DataSource: Send + 'static {
     /// `server_time_us` is the current server clock in microseconds since
     /// server start — use it as `timestamp_us` in the returned [`PollResult`]
     /// unless you have a more precise sample timestamp.
-    fn poll(&mut self, server_time_us: f64) -> PollResult;
+    /// `subscribed` is the set of watchable paths that at least one GUI client
+    /// is currently subscribed to. You may skip computing values for paths that
+    /// are not in this set to avoid unnecessary work.
+    fn poll(&mut self, server_time_us: f64, subscribed: &HashSet<String>) -> PollResult;
 
     /// Apply a write to the datasource. `path` is the watchable's path as
     /// returned from `watchables()`.
@@ -182,4 +187,20 @@ pub trait DataSource: Send + 'static {
     fn connection_status(&self) -> ConnectionStatus {
         ConnectionStatus::Connected
     }
+
+    /// Called just before `poll()` when the GUI has subscribed to new
+    /// watchables since the previous tick. `paths` contains only the
+    /// newly-added paths, not the full subscription set.
+    ///
+    /// Pressing the GUI "Start" button typically triggers this with all
+    /// currently visible watchables.
+    fn on_subscribed(&mut self, _paths: &[&str]) {}
+
+    /// Called just before `poll()` when the GUI has unsubscribed from
+    /// watchables since the previous tick. `paths` contains only the
+    /// removed paths.
+    ///
+    /// Pressing the GUI "Stop" button typically triggers this with all
+    /// currently visible watchables.
+    fn on_unsubscribed(&mut self, _paths: &[&str]) {}
 }

@@ -67,45 +67,53 @@ impl DataSource for SineSource {
         ]
     }
 
-    fn poll(&mut self, server_time_us: f64) -> PollResult {
+    fn poll(&mut self, server_time_us: f64, subscribed: &std::collections::HashSet<String>) -> PollResult {
         let t = self.start.elapsed().as_secs_f64();
         // Use the datasource's own elapsed time (sub-millisecond precision) as
         // the timestamp so the graph x-axis reflects actual sample timing.
         let timestamp_us = t * 1_000_000.0;
         let mut updates = Vec::new();
 
-        updates.push(WatchableUpdate {
-            path: "/signals/sine".into(),
-            value: WatchableValue::Float(self.amplitude * (TAU * 1.0 * t).sin()),
-        });
+        if subscribed.contains("/signals/sine") {
+            updates.push(WatchableUpdate {
+                path: "/signals/sine".into(),
+                value: WatchableValue::Float(self.amplitude * (TAU * 1.0 * t).sin()),
+            });
+        }
 
-        if self.poll_counter % 2 == 0 {
+        if subscribed.contains("/signals/cosine") && self.poll_counter % 2 == 0 {
             updates.push(WatchableUpdate {
                 path: "/signals/cosine".into(),
                 value: WatchableValue::Float(self.amplitude * (TAU * 1.0 * t).cos()),
             });
         }
-        if self.poll_counter % 10 == 0 {
+        if subscribed.contains("/params/amplitude") && self.poll_counter % 10 == 0 {
             updates.push(WatchableUpdate {
                 path: "/params/amplitude".into(),
                 value: WatchableValue::Float(self.amplitude),
             });
         }
 
-        updates.push(WatchableUpdate {
-            path: "/meta/server_time".into(),
-            value: WatchableValue::Float(server_time_us / 1_000_000.0), // convert µs → s
-        });
+        if subscribed.contains("/meta/server_time") {
+            updates.push(WatchableUpdate {
+                path: "/meta/server_time".into(),
+                value: WatchableValue::Float(server_time_us / 1_000_000.0), // convert µs → s
+            });
+        }
 
-        updates.push(WatchableUpdate {
-            path: "/meta/poll_time".into(),
-            value: WatchableValue::Float(t),
-        });
+        if subscribed.contains("/meta/poll_time") {
+            updates.push(WatchableUpdate {
+                path: "/meta/poll_time".into(),
+                value: WatchableValue::Float(t),
+            });
+        }
 
-        updates.push(WatchableUpdate {
-            path: "/meta/poll_counter".into(),
-            value: WatchableValue::Uint(self.poll_counter as u64),
-        });
+        if subscribed.contains("/meta/poll_counter") {
+            updates.push(WatchableUpdate {
+                path: "/meta/poll_counter".into(),
+                value: WatchableValue::Uint(self.poll_counter as u64),
+            });
+        }
 
         self.poll_counter += 1;
 
@@ -140,6 +148,14 @@ impl DataSource for SineSource {
         //    ConnectionStatus::Connecting
         //    ConnectionStatus::Disconnected
     }
+
+    fn on_subscribed(&mut self, paths: &[&str]) {
+        log::info!("GUI started watching: {:?}", paths);
+    }
+
+    fn on_unsubscribed(&mut self, paths: &[&str]) {
+        log::info!("GUI stopped watching: {:?}", paths);
+    }
 }
 
 #[tokio::main]
@@ -170,6 +186,23 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or_else(|| "0.0.0.0:8765".into())
     };
 
+    // ── Start the server as a background task ────────────────────────────────
+    // `shutdown_tx` / `shutdown_rx` form a one-shot channel: sending on
+    // `shutdown_tx` tells the server to stop accepting connections, close the
+    // active client (if any), abort the poller, and return.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
     log::info!("Starting sine-wave datasource on {addr}");
-    run(SineSource::new(), &addr, 20).await // 20 ms = 50 Hz
+    let server = tokio::spawn(
+        run(SineSource::new(), addr, 20, async { let _ = shutdown_rx.await; })
+    );
+
+    // ── Wait for Ctrl-C, then stop the server gracefully ─────────────────────
+    tokio::signal::ctrl_c().await?;
+    log::info!("Ctrl-C received — stopping server…");
+
+    let _ = shutdown_tx.send(());
+    server.await??;
+    log::info!("Goodbye.");
+    Ok(())
 }

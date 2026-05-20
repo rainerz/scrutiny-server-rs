@@ -18,7 +18,7 @@ impl DataSource for DemoSource {
         }]
     }
 
-    fn poll(&mut self, server_time_us: f64) -> PollResult {
+    fn poll(&mut self, server_time_us: f64, _subscribed: &std::collections::HashSet<String>) -> PollResult {
         self.counter += 1;
         PollResult {
             timestamp_us: server_time_us,
@@ -75,5 +75,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let source = DemoSource { counter: 0 };
-    run(source, &addr, 100).await
+    // Pass `std::future::pending()` to run until the process exits.
+    // Swap in a oneshot receiver to support programmatic shutdown.
+    run(source, addr, 100, std::future::pending()).await
 }

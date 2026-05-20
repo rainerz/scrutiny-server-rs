@@ -8,33 +8,29 @@
 ///  │                                                              │
 ///  │  Arc<Datastore>  (read-only, shared)                        │
 ///  │  Arc<Mutex<ValueStore>>  (latest values, written by poller) │
-///  │  broadcast::Sender<ValueEvent>  (changed values)            │
 ///  │  mpsc::Sender<WriteCommand>  (writes → datasource)          │
 ///  │  start_time: Instant                                         │
 ///  │  session_id: String                                          │
 ///  │                                                              │
-///  │  ┌────────────┐   ┌────────────┐   ┌────────────────────┐   │
-///  │  │  Listener  │   │  Poller    │   │  ConnectionTask×N  │   │
-///  │  │  task      │   │  task      │   │                    │   │
-///  │  │            │   │  (100 ms)  │   │  framing codec     │   │
-///  │  │  accept()  │   │  polls DS  │   │  request handler   │   │
-///  │  │  → spawn   │   │  broadcasts│   │  subscription state│   │
-///  │  └────────────┘   └────────────┘   └────────────────────┘   │
+///  │  ┌────────────┐   ┌────────────┐   ┌──────────────────────┐ │
+///  │  │  Listener  │   │  Poller    │   │  ConnectionHandler   │ │
+///  │  │  (main)    │   │  task      │   │  (sequential: one    │ │
+///  │  │            │   │  (poll_ms) │   │   at a time)         │ │
+///  │  │  accept()  │   │  polls DS  │   │  framing codec       │ │
+///  │  │  → handle  │   │  mpsc send │   │  request handler     │ │
+///  │  └────────────┘   └────────────┘   └──────────────────────┘ │
 ///  └──────────────────────────────────────────────────────────────┘
 /// ```
 use std::{
-    collections::HashMap,
+    collections::HashSet,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
 use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use tokio::{
-    net::{TcpListener, TcpStream},
-    sync::{broadcast, mpsc},
-    time,
-};
+use tokio::
+    { net::{TcpListener, TcpStream}, sync::mpsc, time };
 use tokio_util::codec::Framed;
 use uuid::Uuid;
 
@@ -64,11 +60,12 @@ struct ServerShared {
     write_tx: mpsc::Sender<WriteCommand>,
     start_time: Instant,
     session_id: String,
-    /// Approximate count of active connections (best-effort).
-    conn_count: Arc<Mutex<usize>>,
     /// Latest connection status reported by the datasource.
     /// Updated by the poller task; read by `make_server_status`.
     conn_status: Arc<Mutex<ConnectionStatus>>,
+    /// Paths currently subscribed by the connected client.
+    /// Snapshotted before every `DataSource::poll()` call.
+    subscribed: Arc<Mutex<HashSet<String>>>,
 }
 
 // ── public entry point ───────────────────────────────────────────────────────
@@ -82,9 +79,11 @@ struct ServerShared {
 /// Blocks until the process is interrupted.
 pub async fn run<DS: DataSource>(
     datasource: DS,
-    addr: &str,
+    addr: impl Into<String>,
     poll_interval_ms: u64,
+    shutdown: impl std::future::Future<Output = ()> + Send,
 ) -> anyhow::Result<()> {
+    let addr = addr.into();
     // --- build datastore from datasource metadata ---------------------------
     let mut datastore = Datastore::default();
     datastore.populate(datasource.watchables());
@@ -93,12 +92,12 @@ pub async fn run<DS: DataSource>(
     let value_store = Arc::new(Mutex::new(ValueStore::default()));
 
     // channels
-    let (value_tx, _) = broadcast::channel::<ValueEvent>(512);
     let (write_tx, write_rx) = mpsc::channel::<WriteCommand>(256);
+    let value_sender: Arc<Mutex<Option<mpsc::Sender<ValueEvent>>>> = Arc::new(Mutex::new(None));
 
     let session_id = Uuid::new_v4().to_string();
-    let conn_count = Arc::new(Mutex::new(0usize));
     let conn_status = Arc::new(Mutex::new(ConnectionStatus::Connected));
+    let subscribed = Arc::new(Mutex::new(HashSet::<String>::new()));
 
     let shared = Arc::new(ServerShared {
         datastore: datastore.clone(),
@@ -106,45 +105,60 @@ pub async fn run<DS: DataSource>(
         write_tx,
         start_time: Instant::now(),
         session_id,
-        conn_count: conn_count.clone(),
         conn_status: conn_status.clone(),
+        subscribed: subscribed.clone(),
     });
 
     // --- start background tasks ---------------------------------------------
-    spawn_poller(
+    let poller = spawn_poller(
         datasource,
         value_store.clone(),
-        value_tx.clone(),
+        value_sender.clone(),
         write_rx,
         poll_interval_ms,
         shared.start_time,
         conn_status,
+        subscribed,
     );
 
     // --- listen for connections ---------------------------------------------
-    let listener = TcpListener::bind(addr).await?;
-    log::info!("Scrutiny server listening on {}", addr);
+    let listener = TcpListener::bind(&addr).await?;
+    log::info!("Scrutiny server listening on {addr}");
 
+    tokio::pin!(shutdown);
+    let mut shutting_down = false;
     loop {
-        let (stream, peer) = listener.accept().await?;
-        log::info!("New connection from {}", peer);
+        let (stream, peer) = tokio::select! {
+            result = listener.accept() => result?,
+            _ = &mut shutdown, if !shutting_down => {
+                break;
+            }
+        };
+        log::info!("Connection from {peer}");
+
+        let (tx, value_rx) = mpsc::channel::<ValueEvent>(512);
+        *value_sender.lock().unwrap() = Some(tx);
 
         let conn_id = Uuid::new_v4().to_string();
-        let shared = shared.clone();
-        let value_rx = value_tx.subscribe();
-
-        *conn_count.lock().unwrap() += 1;
-
-        tokio::spawn(async move {
-            if let Err(e) =
-                handle_connection(stream, conn_id.clone(), shared.clone(), value_rx).await
-            {
-                log::warn!("[{}] connection error: {}", conn_id, e);
+        tokio::select! {
+            result = handle_connection(stream, conn_id.clone(), shared.clone(), value_rx) => {
+                if let Err(e) = result {
+                    log::warn!("[{conn_id}] connection error: {e}");
+                }
             }
-            *shared.conn_count.lock().unwrap() -= 1;
-            log::info!("[{}] connection closed", conn_id);
-        });
+            _ = &mut shutdown, if !shutting_down => {
+                shutting_down = true;
+                log::info!("[{conn_id}] server shutting down, closing connection");
+            }
+        }
+        *value_sender.lock().unwrap() = None;
+        log::info!("[{conn_id}] disconnected");
+        if shutting_down { break; }
     }
+
+    poller.abort();
+    log::info!("Server stopped");
+    Ok(())
 }
 
 // ── datasource poller ────────────────────────────────────────────────────────
@@ -152,21 +166,33 @@ pub async fn run<DS: DataSource>(
 fn spawn_poller<DS: DataSource>(
     mut ds: DS,
     value_store: Arc<Mutex<ValueStore>>,
-    tx: broadcast::Sender<ValueEvent>,
+    value_sender: Arc<Mutex<Option<mpsc::Sender<ValueEvent>>>>,
     mut write_rx: mpsc::Receiver<WriteCommand>,
     poll_interval_ms: u64,
     start: Instant,
     conn_status: Arc<Mutex<ConnectionStatus>>,
-) {
+    subscribed: Arc<Mutex<HashSet<String>>>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut poll_interval = time::interval(Duration::from_millis(poll_interval_ms));
+        let mut prev_subscribed = HashSet::<String>::new();
         loop {
             tokio::select! {
                 _ = poll_interval.tick() => {
                     let now_us = start.elapsed().as_secs_f64() * 1_000_000.0;
                     // Update connection status before polling values.
                     *conn_status.lock().unwrap() = ds.connection_status();
-                    let result = ds.poll(now_us);
+                    // Snapshot subscribed paths without holding the lock during poll().
+                    let subscribed = subscribed.lock().unwrap().clone();
+                    // Notify datasource of any subscription changes since the last tick.
+                    {
+                        let new_subs: Vec<&str> = subscribed.difference(&prev_subscribed).map(String::as_str).collect();
+                        let gone_subs: Vec<&str> = prev_subscribed.difference(&subscribed).map(String::as_str).collect();
+                        if !new_subs.is_empty() { ds.on_subscribed(&new_subs); }
+                        if !gone_subs.is_empty() { ds.on_unsubscribed(&gone_subs); }
+                    }
+                    prev_subscribed = subscribed.clone();
+                    let result = ds.poll(now_us, &subscribed);
                     if !result.updates.is_empty() {
                         let ts = result.timestamp_us;
                         let mut store = value_store.lock().unwrap();
@@ -179,7 +205,9 @@ fn spawn_poller<DS: DataSource>(
                             .collect();
                         drop(store);
                         log::trace!("poll: {} updates, ts={:.0} µs", pairs.len(), ts);
-                        let _ = tx.send(ValueEvent { updates: Arc::new(pairs), timestamp_us: ts });
+                        if let Some(tx) = value_sender.lock().unwrap().as_ref() {
+                            let _ = tx.try_send(ValueEvent { updates: Arc::new(pairs), timestamp_us: ts });
+                        }
                     }
                 }
                 Some(cmd) = write_rx.recv() => {
@@ -190,15 +218,47 @@ fn spawn_poller<DS: DataSource>(
                 }
             }
         }
-    });
+})
 }
 
 // ── per-connection handler ───────────────────────────────────────────────────
 
+/// RAII guard: tracks subscriptions and clears them from the shared set
+/// when the connection drops (including on error / unexpected disconnect).
+struct SubGuard {
+    subs: HashSet<String>,
+    subscribed: Arc<Mutex<HashSet<String>>>,
+}
+
+impl SubGuard {
+    fn new(subscribed: Arc<Mutex<HashSet<String>>>) -> Self {
+        Self { subs: HashSet::new(), subscribed }
+    }
+
+    fn subscribe(&mut self, path: &str) {
+        if self.subs.insert(path.to_owned()) {
+            self.subscribed.lock().unwrap().insert(path.to_owned());
+        }
+    }
+
+    fn unsubscribe(&mut self, path: &str) {
+        if self.subs.remove(path) {
+            self.subscribed.lock().unwrap().remove(path);
+        }
+    }
+}
+
+impl Drop for SubGuard {
+    fn drop(&mut self) {
+        let mut set = self.subscribed.lock().unwrap();
+        for path in &self.subs {
+            set.remove(path);
+        }
+    }
+}
+
 /// State that lives only within a single connection task.
 struct ConnState {
-    /// watchable ID → () (just tracking which IDs are subscribed)
-    subscriptions: HashMap<String, ()>,
     invalid_request_count: u64,
 }
 
@@ -206,13 +266,11 @@ async fn handle_connection(
     stream: TcpStream,
     conn_id: String,
     shared: Arc<ServerShared>,
-    mut value_rx: broadcast::Receiver<ValueEvent>,
+    mut value_rx: mpsc::Receiver<ValueEvent>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut framed = Framed::new(stream, ScrutinyCodec::new());
-    let mut state = ConnState {
-        subscriptions: HashMap::new(),
-        invalid_request_count: 0,
-    };
+    let mut state = ConnState { invalid_request_count: 0 };
+    let mut sub_guard = SubGuard::new(shared.subscribed.clone());
 
     // send welcome on connect
     send(&mut framed, make_welcome(shared.start_time)).await?;
@@ -235,7 +293,8 @@ async fn handle_connection(
                     Some(Ok(msg)) => {
                         let cmd_name = msg.get("cmd").and_then(Value::as_str).unwrap_or("").to_owned();
                         let reqid = msg.get("reqid").and_then(Value::as_i64);
-                        match dispatch(&cmd_name, reqid, &msg, &mut state, &shared).await {
+                        log::debug!("[{conn_id}] recv: {msg}");
+                        match dispatch(&cmd_name, reqid, &msg, &mut state, &shared, &mut sub_guard).await {
                             Ok(response) => {
                                 for r in response {
                                     send(&mut framed, r).await?;
@@ -251,16 +310,13 @@ async fn handle_connection(
                 }
             }
 
-            // ── value update broadcast ────────────────────────────────────
+            // ── value updates from poller ────────────────────────────────────
             event = value_rx.recv() => {
                 match event {
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        log::warn!("[{}] value broadcast lagged {} messages", conn_id, n);
-                    }
-                    Err(_) => break,
-                    Ok(ev) => {
+                    None => break, // channel closed when sender is dropped
+                    Some(ev) => {
                         let updates: Vec<WatchableUpdateRecord> = ev.updates.iter()
-                            .filter(|(id, _)| state.subscriptions.contains_key(id))
+                            .filter(|(id, _)| sub_guard.subs.contains(id.as_str()))
                             .map(|(id, val)| WatchableUpdateRecord {
                                 id: id.clone(),
                                 v: val.to_json(),
@@ -299,6 +355,7 @@ async fn dispatch(
     msg: &Value,
     state: &mut ConnState,
     shared: &Arc<ServerShared>,
+    sub_guard: &mut SubGuard,
 ) -> Result<Vec<Value>, String> {
     log::debug!("dispatch: cmd={} reqid={:?}", cmd_name, reqid);
     match cmd_name {
@@ -428,7 +485,7 @@ async fn dispatch(
                 let entry = shared.datastore.get(path)
                     .ok_or_else(|| format!("Unknown watchable: {path}"))?;
                 subscribed.insert(path.to_string(), make_detailed(entry));
-                state.subscriptions.insert(path.to_string(), ());
+                sub_guard.subscribe(path);
             }
             log::debug!("subscribed to {} watchables", paths.len());
             let mut out = vec![json_serialize(&S2cSubscribeWatchable {
@@ -463,8 +520,8 @@ async fn dispatch(
                 .collect::<Vec<_>>();
             let mut unsubscribed = Vec::new();
             for path in &paths {
-                if let Some(_) = shared.datastore.get(path) {
-                    state.subscriptions.remove(*path);
+                if shared.datastore.get(path).is_some() {
+                    sub_guard.unsubscribe(path);
                 }
                 unsubscribed.push(path.to_string());
             }
@@ -510,14 +567,13 @@ async fn dispatch(
 
         cmd::GET_SERVER_STATS => {
             let uptime = shared.start_time.elapsed().as_secs_f64();
-            let client_count = *shared.conn_count.lock().unwrap();
             Ok(vec![json_serialize(&S2cGetServerStats {
                 cmd: cmd::RESPONSE_GET_SERVER_STATS,
                 reqid,
                 uptime,
                 invalid_request_count: state.invalid_request_count,
                 unexpected_error_count: 0,
-                client_count,
+                client_count: 1,
             })])
         }
 
@@ -579,6 +635,12 @@ async fn dispatch(
             })])
         }
 
+        cmd::SET_THROTTLING => {
+            // We don't implement rate-limiting, but we must respond so the GUI
+            // can proceed. Report throttling as disabled.
+            Ok(vec![json!({ "cmd": cmd::RESPONSE_SET_THROTTLING, "reqid": reqid, "enabled": false, "update_rate": null })])
+        }
+
         // Datalogging commands – return unavailable/empty responses so the GUI
         // doesn't stall waiting for a reply.
         cmd::REQUEST_DATALOGGING_ACQUISITION => {
@@ -610,6 +672,7 @@ async fn send(
     framed: &mut Framed<TcpStream, ScrutinyCodec>,
     msg: Value,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    log::trace!("send: {msg}");
     framed.send(msg).await?;
     Ok(())
 }
